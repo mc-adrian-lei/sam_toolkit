@@ -1,597 +1,415 @@
-# Samsung Galaxy A15/A16 Hardening Toolkit — Windows Scripts
-
-## Overview
-
-This toolkit provides **Windows-based scripts** (Batch and PowerShell) to:
-
-1. **Harden** Samsung Galaxy A15/A16 devices by removing surveillance bloatware (AppCloud/Aura, Facebook, carrier MSM, etc.)
-2. **Preserve** all critical system components and evidence chains
-3. **Audit** and **detect anomalies** after hardening to catch misuse
-
-All operations are **non-root** and execute through ADB (Android Debug Bridge), making them reversible and safe.
-
----
-
-## Quick Start
-
-### Prerequisites
-
-1. **Android Debug Bridge (ADB)** installed and in your system PATH
-   - Download: https://developer.android.com/tools/adb
-   - Or install via: `choco install adb` (Windows via Chocolatey)
-
-2. **Samsung Galaxy A15 or A16** connected via USB cable
-
-3. **Developer Options enabled** on phone:
-   - Settings > About Phone > Build Number (tap 7 times)
-   - Settings > Developer Options > USB Debugging (toggle ON)
-   - Authorize USB debugging when prompted
-
-### Running the Hardening Script
-
-**Option 1: Windows Batch (CMD)**
-
-```batch
-.\samsung_hardening.bat
-```
-
-Or from Command Prompt:
-
-```cmd
-cd \path\to\scripts
-samsung_hardening.bat
-```
-
-**Option 2: PowerShell**
-
-```powershell
-Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
-.\samsung_hardening.ps1
-```
-
-Both scripts will:
-- ✓ Verify ADB and device connection
-- ✓ Create a baseline audit (before state)
-- ✓ Display removal plan for review
-- ✓ Ask for user confirmation
-- ✓ Remove/disable bloatware packages
-- ✓ Create post-hardening snapshot (after state)
-- ✓ Generate audit reports and logs
-
----
-
-## Script Details
-
-### samsung_hardening.bat
-
-Pure Windows Batch script—no dependencies beyond ADB.
-
-**Features:**
-- Device connection verification
-- Baseline capture and hashing
-- Package removal with error handling
-- Logging to timestamped file (`hardening_YYYYMMDD_HHMMSS.log`)
-- Post-hardening snapshot for comparison
-- Audit artifacts in `audit_baseline_YYYYMMDD_HHMMSS/` directory
-
-**Usage:**
-```batch
-.\samsung_hardening.bat
-```
-
-**Output:**
-```
-hardening_20251204_134502.log
-audit_baseline_20251204_134502/
-  ├── packages_baseline.txt
-  ├── packages_after.txt
-  ├── package_dump.txt
-  ├── ps_baseline.txt
-  ├── netstat_baseline.txt
-  └── logcat_baseline.txt
-```
-
----
-
-### samsung_hardening.ps1
-
-PowerShell script with additional features and cleaner error handling.
-
-**Features:**
-- Device verification
-- Baseline capture
-- Configurable dry-run mode
-- Skip-baseline option
-- Detailed logging
-- Post-hardening analysis
-
-**Usage:**
-
-```powershell
-# Standard run
-.\samsung_hardening.ps1
-
-# Dry run (show what would be removed without making changes)
+This upgrade implements tiered component-disabling fallback and core-exclusion
+harmonization across PowerShell and Batch scripts. The "double-effort" strategy attempts
+removal via three escalating methods before accepting partial failure.
+Key improvements:
+Cascading disable methods (uninstall → disable-user → component-level disable)
+Unified core exclusion lists across platforms
+Enhanced dumpsys parsing for granular component targeting
+Better logging and status tracking
+Add this function to your samsung_hardening.ps1 script. It replaces the inline uninstall
+logic with intelligent fallback:
+function Disable-PackageAggressively {
+<#
+.SYNOPSIS
+Attempts to disable/remove a package via tiered fallback approach.
+.DESCRIPTION
+Tries three methods in sequence:
+1. pm uninstall --user 0 (user-level uninstall)
+2. pm disable-user --user 0 (user-level disable)
+3. Component-level disable (activities, services, receivers, providers)
+.PARAMETER PackageName
+The package identifier (e.g., com.samsung.android.appcloud)
+.PARAMETER DryRun
+If set, logs actions without executing ADB commands
+.OUTPUTS
+Samsung Galaxy A15/A16 Hardening Script
+Upgrade
+Overview
+Part 1: PowerShell Function — DisablePackageAggressively
+String: One of [REMOVED | DISABLED | PARTIAL | SKIPPED | DRY | FAILED
+#>
+param(
+[string]$PackageName,
+[switch]$DryRun
+)
+Write-Log "Processing package: $PackageName"
+# === STAGE 0: Check if installed ===
+$installed = Invoke-ADB "shell pm list packages $PackageName" | Select-String
+if (-not $installed) {
+Write-Log " [-] Not installed, skipping"
+return "SKIPPED"
+}
+# === DRY RUN MODE ===
+if ($DryRun) {
+Write-Host " [DRY RUN] Would attempt uninstall/disable for: $PackageName
+Write-Log " [DRY RUN] $PackageName"
+return "DRY"
+}
+# === STAGE 1: Try uninstall --user 0 ===
+Write-Log " [STAGE 1] Attempting pm uninstall --user 0"
+$out = Invoke-ADB "shell pm uninstall --user 0 $PackageName"
+if ($out -match "Success") {
+Write-Log " [+] UNINSTALLED (user 0)"
+return "REMOVED"
+}
+Write-Log " [!] Uninstall failed; attempting Stage 2"
+# === STAGE 2: Try disable-user --user 0 ===
+Write-Log " [STAGE 2] Attempting pm disable-user --user 0"
+$out = Invoke-ADB "shell pm disable-user --user 0 $PackageName"
+if ($out -match "Success") {
+Write-Log " [+] DISABLED (user 0)"
+return "DISABLED"
+}
+Write-Log " [!] disable-user failed; falling back to Stage 3 (component-level)"
+# === STAGE 3: Component-level disable ===
+Write-Log " [STAGE 3] Attempting component-level disable"
+$dump = Invoke-ADB "shell dumpsys package $PackageName"
+if (-not $dump) {
+Write-Log " [!] dumpsys returned no data; cannot enumerate components" "W
+Write-Log " [!] $PackageName - FAILED (no dumpsys output)"
+return "FAILED"
+}
+# Extract component patterns: ActivityResolver, service, receiver, provider
+$patterns = @(
+"ActivityResolver",
+"^\s+service ",
+"^\s+receiver ",
+"^\s+provider "
+)
+$components = @()
+# Parse dumpsys output line-by-line
+foreach ($line in ($dump -split "`n")) {
+foreach ($p in $patterns) {
+if ($line -match $p -and $line -match " $([regex]::Escape($PackageName))/")
+# Extract ComponentName like "com.pkg/.SomeClass"
+if ($line -match "($([regex]::Escape($PackageName))/[^ ]+)") {
+$components += $matches[1]
+}
+}
+}
+}
+$components = $components | Sort-Object -Unique
+if ($components.Count -eq 0) {
+Write-Log " [!] No components found to disable" "WARN"
+Write-Log " [!] $PackageName - FAILED (no components enumerated)"
+return "FAILED"
+}
+# Disable each component
+$disabledCount = 0
+foreach ($component in $components) {
+$cmd = "shell pm disable $component"
+$res = Invoke-ADB $cmd
+if ($res -match "new state: disabled" -or $res -match "Package .* new state") {
+Write-Log " [+] Disabled component: $component"
+$disabledCount++
+} else {
+Write-Log " [!] Failed to disable component: $component" "WARN"
+}
+}
+if ($disabledCount -gt 0) {
+Write-Log " [+] Partially disabled $disabledCount/$($components.Count) com
+Write-Log " [!] $PackageName - PARTIAL ($disabledCount components disabl
+return "PARTIAL"
+}
+Write-Log " [!] $PackageName - FAILED (component disable had no success)"
+return "FAILED"
+}
+Replace your existing foreach ($pkg in $bloatwarePackages) block with this enhanced
+version:
+Write-Log "========== STAGE: Bloatware Removal =========="
+Write-Log "Total packages to process: bloatwarePackages.Count)"
+Write-Log ""
+$removed = 0
+$disabled = 0
+$partial = 0
+$failed = 0
+$skipped = 0
+foreach ($pkg in $bloatwarePackages) {
+$result = Disable-PackageAggressively -PackageName DryRun
+switch ($result) {
+"REMOVED" {
+$removed++
+Write-Host " [OK] Removed" -ForegroundColor Green
+}
+"DISABLED" {
+$disabled++
+Write-Host " [OK] Disabled" -ForegroundColor Green
+}
+"PARTIAL" {
+$partial++
+Write-Host " [PARTIAL] Some components disabled" -ForegroundColor Yel
+}
+"SKIPPED" {
+$skipped++
+Write-Host " [SKIP] Not installed" -ForegroundColor Gray
+}
+"DRY" {
+Write-Host " [DRY RUN]" -ForegroundColor Cyan
+}
+Part 2: Integration into Main Loop
+=== Enhanced removal loop with tiered
+fallback ===
+default {
+$failed++
+Write-Host " [FAIL] Unable to disable" -ForegroundColor Red
+}
+}
+}
+Write-Log ""
+Write-Log "========== Bloatware Removal Summary =========="
+Write-Log "Removed: $removed"
+Write-Log "Disabled: $disabled"
+Write-Log "Partial: $partial"
+Write-Log "Failed: $failed"
+Write-Log "Skipped: $skipped"
+Write-Log "Total processed: removed + $disabled + $partial + $failed + $skipped)"
+Update your samsung_hardening.bat to extend core exclusions and align with PowerShell:
+set CORE[0]=android
+set CORE[1]=com.android.systemui
+set CORE[2]=com.android.settings
+set CORE[3]=com.android.packageinstaller
+set CORE[4]=com.google.android.gms
+set CORE[5]=com.android.vending
+set /A CORE_COUNT=6
+set CORE[0]=android
+set CORE[1]=com.android.systemui
+set CORE[2]=com.android.settings
+set CORE[3]=com.android.packageinstaller
+set CORE[4]=com.google.android.gms
+set CORE[5]=com.android.vending
+set CORE[6]=com.android.keychain
+set CORE[7]=com.samsung.android.ims
+set CORE[8]=com.sec.telephony
+set CORE[9]=com.android.permission
+set /A CORE_COUNT=10
+Rationale for additions:
+=== Final summary ===
+Part 3: Batch Script Harmonization
+Current CORE Array (Update From):
+New CORE Array (Update To):
+com.android.keychain — Credential storage (needed for HTTPS, OAuth, certificate
+chains)
+com.samsung.android.ims — IP Multimedia Subsystem (VoIP/5G calling)
+com.sec.telephony — Samsung telephony stack (call handling, SIM management)
+com.android.permission — Permission framework itself
+In your .bat script, locate this section:
+REM Define core exclusions (NEVER REMOVE)
+REM ============================================================================
+setlocal enabledelayedexpansion
+set /A CORE_COUNT=0
+set CORE[0]=android
+set CORE[1]=com.android.systemui
+set CORE[2]=com.android.settings
+set CORE[3]=com.android.packageinstaller
+set CORE[4]=com.google.android.gms
+set CORE[5]=com.android.vending
+set /A CORE_COUNT=6
+And replace it with:
+REM Define core exclusions (NEVER REMOVE)
+REM ============================================================================
+setlocal enabledelayedexpansion
+set /A CORE_COUNT=0
+REM === Critical Android Framework ===
+set CORE[0]=android
+set CORE[1]=com.android.systemui
+set CORE[2]=com.android.settings
+set CORE[3]=com.android.packageinstaller
+REM === Google Services ===
+set CORE[4]=com.google.android.gms
+set CORE[5]=com.android.vending
+REM === Credential & Telephony (NEW) ===
+set CORE[6]=com.android.keychain
+set CORE[7]=com.samsung.android.ims
+set CORE[8]=com.sec.telephony
+set CORE[9]=com.android.permission
+set /A CORE_COUNT=10
+Find and Replace Section
+Add this validation to the top of both scripts to ensure they're using matching exclusion
+lists:
+$coreExclusions = @(
+"android",
+"com.android.systemui",
+"com.android.settings",
+"com.android.packageinstaller",
+"com.google.android.gms",
+"com.android.vending",
+"com.android.keychain",
+"com.samsung.android.ims",
+"com.sec.telephony",
+"com.android.permission"
+)
+function Test-CoreExclusions {
+Write-Log "========== Core Exclusion Validation =========="
+Write-Log "Protected packages: coreExclusions.Count)"
+foreach ($core in $coreExclusions) {
+Write-Log " [+] $core"
+}
+Write-Log ""
+}
+Test-CoreExclusions
+Add this validation block after CORE array definition:
+REM ============================================================================
+REM Validate core exclusions (sanity check)
+REM ============================================================================
+echo.
+echo [] Core Exclusion Validation
+echo [] Protected packages: %CORE_COUNT%
+for /L %%i in (0,1,%CORE_COUNT%) do (
+if defined CORE[%%i] (
+echo [+] !CORE[%%i]!
+)
+)
+Part 4: Validation Logic (Optional but Recommended)
+For PowerShell (samsung_hardening.ps1):
+Call early in script
+For Batch (samsung_hardening.bat):
+echo.
+pause
+Both scripts should skip removal if a package name matches any CORE exclusion. Here's a
+safety check for batch:
+REM === Safety check: prevent core packages from being in removal list ===
+setlocal enabledelayedexpansion
+for /L %%i in (0,1,!PKG_COUNT!) do (
+if defined PKG[%%i] (
+set PKG_NAME=!PKG[%%i]!
+REM Check if this package is in CORE exclusions
+for /L %%j in (0,1,!CORE_COUNT!) do (
+if defined CORE[%%j] (
+if "!PKG_NAME!"=="!CORE[%%j]!" (
+echo [ERROR] Package !PKG_NAME! is in CORE exclusions!
+echo This should never happen. Update your PKG list.
+pause
+exit /b 1
+)
+)
+)
+)
+)
+PowerShell:
 .\samsung_hardening.ps1 -DryRun
-
-# Skip baseline (if already created)
-.\samsung_hardening.ps1 -SkipBaseline
-
-# Verbose output
-.\samsung_hardening.ps1 -Verbose
-```
-
-**Output:**
-```
-hardening_20251204_134502.log
-audit_baseline_20251204_134502/
-  ├── packages_baseline.txt
-  ├── packages_after.txt
-  ├── package_dump.txt
-  ├── package_dump_after.txt
-  ├── ps_baseline.txt
-  ├── permissions_audit.txt
-  └── logcat_baseline.txt
-```
-
----
-
-### anomaly_detect.bat
-
-Detects suspicious activity after hardening.
-
-**Features:**
-- Compares current state to baseline
-- Detects new packages
-- Checks location services, battery, network
-- Scans for suspicious processes
-- Audits dangerous permissions
-
-**Usage:**
-```batch
-.\anomaly_detect.bat audit_baseline_20251204_134502
-```
-
-**Output:**
-```
-anomaly_report_20251204_140530.txt
-```
-
-**Example Report Content:**
-```
-[2025-12-04 14:05:30] [INFO] --- NEW PACKAGES CHECK ---
-[2025-12-04 14:05:31] [INFO] [+] No new packages detected
-
-[2025-12-04 14:05:32] [INFO] --- LOCATION SERVICES CHECK ---
-[2025-12-04 14:05:32] [INFO] Location providers: 
-
-[2025-12-04 14:05:33] [INFO] --- SUSPICIOUS PROCESS SCAN ---
-[2025-12-04 14:05:33] [INFO] [+] No known suspicious processes found
-```
-
----
-
-### anomaly_detect.ps1
-
-PowerShell anomaly detection with structured reporting.
-
-**Usage:**
-```powershell
-.\anomaly_detect.ps1 -BaselineDir audit_baseline_20251204_134502
-
-# With verbose output
-.\anomaly_detect.ps1 -BaselineDir audit_baseline_20251204_134502 -Verbose
-```
-
----
-
-## What Gets Removed
-
-### HIGH PRIORITY (Surveillance/Tracking)
-
-**AppCloud / Aura (IronSource)** — Primary spyware concern
-```
-com.ironsource.aura
-com.aura.oobe
-com.aura.oobe.att
-com.samsung.android.appcloud
-com.samsung.android.app.appcloud
-```
-
-### Medium Priority (Carrier Bloat)
-
-**Mobile Services Manager (MSM)**
-```
-com.att.mobile_services_manager
-com.vzw.hss.myverizon
-com.t_mobile.tmo_mail
-com.samsung.attvvm
-```
-
-### Social/Ad-Tech
-
-**Facebook Spyware Layers**
-```
-com.facebook.system
-com.facebook.appmanager
-com.facebook.services
-```
-
-### Samsung Promotional
-
-```
-com.samsung.android.app.news
-com.samsung.android.game.gametools
-com.samsung.android.tvplus
-com.samsung.android.oneconnect
-com.samsung.android.arzone
-... (and 10+ more promo apps)
-```
-
-### Microsoft
-
-```
-com.microsoft.skydrive
-com.microsoft.office.officehubrow
-```
-
----
-
-## What Does NOT Get Removed
-
-### CORE EXCLUSIONS (Protected)
-
-These are **never touched** to ensure stability and evidence preservation:
-
-```
-android                           # Android System Framework
-com.android.systemui             # System UI
-com.android.settings             # Settings App
-com.android.packageinstaller     # Package Manager
-com.google.android.gms           # Google Play Services
-com.android.vending              # Google Play Store
-com.android.keychain             # Credential Storage
-com.samsung.android.ims          # IMS (calling)
-com.sec.telephony                # Telephony
-com.android.permission           # Permission Manager
-... (and others for security/comms)
-```
-
----
-
-## Workflow
-
-### Step 1: Create Baseline
-```
-Device State Before Hardening
-        ↓
-   Create Audit Snapshot
-   (packages, permissions, processes, network)
-        ↓
-   Saved to: audit_baseline_YYYYMMDD_HHMMSS/
-```
-
-### Step 2: Review & Remove
-```
-Display Removal Plan
-        ↓
-   User Confirmation (Y/N)
-        ↓
-   For each package:
-     1. Check if installed
-     2. Attempt uninstall via adb shell pm uninstall --user 0
-     3. If fails, disable via adb shell pm disable-user --user 0
-        ↓
-   Log results (removed, failed, skipped)
-```
-
-### Step 3: Create Post-Hardening Snapshot
-```
-Device State After Hardening
-        ↓
-   Capture packages_after.txt
-   Capture package_dump_after.txt
-        ↓
-   User compares baseline/ vs. after for verification
-```
-
-### Step 4: Ongoing Monitoring
-```
-Run anomaly_detect.bat/ps1 weekly
-        ↓
-   Compare current state to baseline
-   Detect new packages, suspicious processes
-        ↓
-   Generate report: anomaly_report_YYYYMMDD_HHMMSS.txt
-```
-
----
-
-## Commands Reference
-
-### ADB Setup (on Phone)
-
-Enable Developer Mode:
-```
-Settings > About Phone > Software Information > Build Number (tap 7 times)
-```
-
-Enable USB Debugging:
-```
-Settings > Developer Options > USB Debugging (toggle ON)
-```
-
-### Manual ADB Commands (if needed)
-
-List all packages:
-```cmd
-adb shell pm list packages
-```
-
-Uninstall a package (non-root):
-```cmd
-adb shell pm uninstall --user 0 com.package.name
-```
-
-Disable a package:
-```cmd
-adb shell pm disable-user --user 0 com.package.name
-```
-
-Restore a package:
-```cmd
-adb shell cmd package install-existing com.package.name
-```
-
-Check if package exists:
-```cmd
-adb shell pm list packages | findstr "package_name"
-```
-
-Check package permissions:
-```cmd
-adb shell dumpsys package com.package.name | findstr "permission"
-```
-
-View running processes:
-```cmd
-adb shell ps -aux
-```
-
-Check network connections:
-```cmd
-adb shell netstat
-adb shell ss -tuln
-```
-
----
-
-## Troubleshooting
-
-### Error: "ADB not found in PATH"
-
-**Solution:** Install Android Debug Bridge
-- Download: https://developer.android.com/tools/adb
-- Add to PATH or place `adb.exe` in same directory as scripts
-
-### Error: "No ADB device connected"
-
-**Steps:**
-1. Connect phone via USB cable
-2. On phone: Settings > Developer Options > USB Debugging (toggle ON)
-3. Tap "Allow USB Debugging" when prompted
-4. Run script again
-
-### Error: "Failed to disable/remove package"
-
-**Reason:** Package is protected system app (safe to skip)
-
-**Solution:** Manually remove only if absolutely necessary
-```cmd
-adb shell pm uninstall --user 0 com.package.name
-```
-
-### Device keeps prompting for USB authorization
-
-**Solution:** Uncheck "Always allow from this computer" option if checked, then reauthorize
-
-### Script hangs waiting for device
-
-**Solution:** 
-1. Disconnect USB
-2. Re-connect USB
-3. Reauthorize on phone
-4. Run script again
-
----
-
-## Evidence Preservation & Reporting
-
-### Audit Artifacts
-
-Each hardening creates a timestamped audit directory with baseline snapshots:
-
-```
-audit_baseline_20251204_134502/
-  ├── packages_baseline.txt         # All installed packages BEFORE
-  ├── packages_after.txt            # All installed packages AFTER
-  ├── package_dump.txt              # Full package metadata BEFORE
-  ├── package_dump_after.txt        # Full package metadata AFTER
-  ├── ps_baseline.txt               # Running processes BEFORE
-  ├── netstat_baseline.txt          # Network state BEFORE
-  ├── logcat_baseline.txt           # System logs BEFORE
-  └── permissions_audit.txt         # Permission audit
-```
-
-**Comparisons:**
-```cmd
-fc packages_baseline.txt packages_after.txt > diff.txt
-```
-
-### Log Files
-
-Each run generates a detailed log:
-```
-hardening_20251204_134502.log
-anomaly_report_20251204_140530.txt
-```
-
-**For investigations/reporting:** Archive audit directories and logs with timestamps for chain of custody.
-
----
-
-## Whistleblower & Safe Escalation
-
-If anomaly detection reveals misuse:
-
-### Preserve Evidence
-1. Export audit logs and diffs
-2. Take screenshots
-3. Document timestamps and anomalies
-4. Use separate device for research
-
-### Report Channels
-- **US:** FBI Tip Line, DOJ Corruption Hotline, GAO FraudNet, State AG
-- **Whistleblower Protection:** Consult attorney before filing
-- **Retaliation is actionable:** Document link between disclosure and adverse actions
-
----
-
-## Safety & Recovery
-
-### All Removals Are Reversible
-
-The `--user 0` flag means:
-- ✓ Non-root execution
-- ✓ Can be reversed: `adb shell cmd package install-existing com.package.name`
-- ✓ Factory reset restores all preloaded apps
-- ✓ OTA updates may reinstall bloatware
-
-### Core Stability
-
-Scripts protect all critical Android and Samsung services:
-- ✓ System framework and UI
-- ✓ Telephony, IMS, messaging
-- ✓ Security and keystore
-- ✓ OTA/update mechanisms
-- ✓ Google Play ecosystem (if used)
-
-### If Device Breaks
-
-**Factory Reset:**
-```
-Settings > General Management > Reset > Factory Reset
-(Wipes data; restores all apps)
-```
-
-**Or restore from backup:**
-```
-Plug into PC with Samsung Kies/SmartSwitch
-Restore from backup
-```
-
----
-
-## Advanced Usage
-
-### Dry Run Mode (PowerShell)
-
-Test without making changes:
-```powershell
-.\samsung_hardening.ps1 -DryRun
-```
-
-### Skip Baseline (Reuse Existing)
-
-```powershell
-.\samsung_hardening.ps1 -SkipBaseline
-```
-
-### Custom Baseline Location (Manual)
-
-```cmd
-copy audit_baseline_20251204_134502 my_custom_audit
-.\anomaly_detect.bat my_custom_audit
-```
-
-### Export Audit for External Review
-
-```cmd
-7z a -r audit_archive.7z audit_baseline_20251204_134502 hardening_*.log
-```
-
----
-
-## FAQs
-
-**Q: Will these scripts root my phone?**  
-A: No. All operations use `pm uninstall --user 0` which is non-root and safe.
-
-**Q: Can I undo changes?**  
-A: Yes. Use `adb shell cmd package install-existing <pkg>` or factory reset.
-
-**Q: Will OTA updates reinstall bloatware?**  
-A: Possibly. Some preloaded apps may reappear; rerun hardening after major updates.
-
-**Q: Can I use these scripts on other Samsung models?**  
-A: Yes. Most bloatware packages are common across Samsung phones. Core exclusions may vary slightly by region/variant.
-
-**Q: Does this affect functionality?**  
-A: No. Only removes promo/telemetry/ad-tech apps. All core features (calls, SMS, camera, etc.) remain intact.
-
-**Q: How often should I run anomaly detection?**  
-A: Weekly or bi-weekly; more frequently if investigating suspected misuse.
-
----
-
-## Support & Documentation
-
-- **Android Security:** https://developer.android.com/privacy-and-security
-- **ADB Documentation:** https://developer.android.com/tools/adb
-- **Samsung Knox:** https://www.samsungknox.com/en
-- **SMEX Research (AppCloud/Aura):** https://www.alestiklal.net/en/article/samsung-s-aura-israeli-spyware-in-your-pocket
-
----
-
-## Version Info
-
-**Version:** 1.0  
-**Date:** December 4, 2025  
-**Tested On:** Windows 10, Windows 11 (with ADB)  
-**Compatible Devices:** Samsung Galaxy A15, A16 (and similar models)  
-**Execution:** Non-root, user 0, reversible  
-
----
-
-## Legal Disclaimer
-
-This toolkit is for **personal device hardening and security research** purposes only.
-
-- Users are responsible for their own devices
-- Removing system apps may violate device warranties
-- Always create backups before major changes
-- Consult legal counsel if investigating suspected misuse or government abuse
-
----
-
-## Changelog
-
-### v1.0 (2025-12-04)
-- Initial release
-- Batch and PowerShell hardening scripts
-- Anomaly detection (Batch and PowerShell)
-- Comprehensive documentation
-- Support for A15/A16
-- AppCloud/Aura, Facebook, carrier MSM, Samsung promo removals
-- Core component protection
-- Audit and chain-of-custody support
-# Batch version
-.\samsung_hardening.bat
-
-# Or PowerShell version
-.\samsung_hardening.ps1
-
-# Later, check for anomalies:
-.\anomaly_detect.bat audit_baseline_20251204_134502
-# or
-.\anomaly_detect.ps1 -BaselineDir audit_baseline_20251204_134502
+Batch:
+REM Modify the beginning of samsung_hardening.bat:
+set DRY_RUN=1
+REM Then add this condition around all removal commands:
+if !DRY_RUN! equ 0 (
+adb shell pm uninstall ...
+)
+Part 5: Cross-Check Logic
+Part 6: Testing & Validation
+Dry-Run (Recommended First):
+adb shell pm list packages | grep -E
+"android$|systemui|settings|gms|vending|keychain|ims|telephony|permission"
+All should return results. If any are missing, the device is in a broken state.
+adb shell pm list packages | grep -E "aura|facebook|samsung.android.app.news"
+Should return empty or minimal results.
+Component Old New Benefit
+Removal
+Strategy
+Single
+attempt
+(uninstall)
+Tiered 3-stage
+fallback
+Handles
+OEM/carrier
+protections better
+Core
+Exclusions
+6 packages 10 packages
+Protects keychain,
+IMS, telephony
+ComponentLevel
+Disable
+Not
+implemente
+d
+Full dumpsys
+parsing
+Granular fallback
+when package-level
+fails
+Logging Basic
+Stage-by-stage
+with status
+codes
+Better auditing and
+debugging
+Cross-Script
+Sync
+Manual
+Unified lists in
+both scripts
+Reduced desync
+risk
+1. Backup current scripts — Save existing .bat and .ps1 versions
+2. Integrate PowerShell function — Add Disable-PackageAggressively to
+samsung_hardening.ps1
+3. Update CORE array — Extend both .bat and .ps1 core exclusion lists
+4. Test with --DryRun — Verify logic before live execution
+5. Monitor removal results — Review logs for PARTIAL/FAILED entries
+6. Document deviations — Note which packages failed to fully disable (they may need
+component-specific blocking)
+Verify Protected Packages:
+Verify Removed Packages:
+Summary of Changes
+Next Steps
+LinuxConfig: Remove Bloatware
+Kaspersky: Disable Android Bloatware
+TechFinitive: App Cloud Delete
+Awesome Android Root: Debloating
+ADB Command Use Case
+Succ
+ess
+Rate
+Notes
+pm uninstall --
+user 0 PKG
+Remove userinstalled or
+patchable system
+apps
+70%
+Fails on protected
+OEM/carrier apps
+pm disable-user -
+-user 0 PKG
+Disable in user
+space without
+removing
+85%
+Works when
+uninstall blocked;
+app may restart on
+boot
+pm disable PKG
+System-level
+disable (requires
+root)
+N/A
+Not usable without
+rooting
+Component
+disable via pm
+disable
+COMPONENT
+Granular
+shutdown
+(activities,
+services,
+receivers)
+60-
+90%
+Fallback when
+package-level fails;
+prevents autostart
+dumpsys
+package PKG
+Enumerate
+components
+95%
+Always succeeds if
+package exists
+Document version: 1.0 (December 2025)
+Last updated: 2025-12-04
+Author: Security Research Team
+References
+Appendix: Full Comparison Table
